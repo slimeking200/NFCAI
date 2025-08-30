@@ -1,11 +1,11 @@
 <!--
 File: index.html
 Host: GitHub Pages (static). No server here.
-Why a relay? Never expose your OpenAI API key in client code. Configure a backend relay URL (e.g., Cloudflare Worker, Vercel/Netlify Function) that accepts { tagContext, message, history } and returns { reply }.
-Relay contract (POST JSON):
-  URL: https://your-relay.example.com/api/chat
-  Body: { tagContext: object, message: string, history: Array<{role: 'user'|'assistant'|'system', content: string}> }
-  Response: { reply: string, model?: string }
+Persona goals implemented:
+- Per-tag chat history persisted locally by a stable persona key.
+- Persona key priority: NFC serialNumber > tag.id > hash(JSON).
+- On scan: NFC JSON overwrites stored JSON for that persona (authoritative), and the app switches to that persona and its history only.
+- Between sessions: last persona auto-restored (JSON + chat history).
 -->
 <!doctype html>
 <html lang="en">
@@ -73,8 +73,8 @@ Relay contract (POST JSON):
 
     <section class="panel">
       <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:6px;">
-        <div><strong>Tag JSON</strong> <span class="hint">Editable</span></div>
-        <span id="tagId" class="pill">no tag</span>
+        <div><strong>Tag JSON</strong> <span class="hint">Editable. Scans overwrite stored JSON for that tag.</span></div>
+        <span id="tagId" class="pill">no persona</span>
       </div>
       <textarea id="json" placeholder='Scan an NFC tag (application/json), or click "Load Example JSON"'></textarea>
       <div class="row" style="justify-content:space-between; align-items:center; margin-top: 6px;">
@@ -104,34 +104,49 @@ Relay contract (POST JSON):
     // --- tiny helpers ---
     const $ = (s) => document.querySelector(s);
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    const log = (...a) => { const el = $('#log'); el.textContent = [el.textContent, a.join(' ')].filter(Boolean).join('\n'); };
+    const log = (...a) => { const el = $('#log'); el.textContent = [el.textContent, a.join(' ')].filter(Boolean).join('
+'); };
+    const httpsOK = location.protocol === 'https:' || location.hostname === 'localhost';
 
     // --- state ---
-    let tagContext = null;
-    let tagId = null;
-    let history = [];
+    let tagContext = null;  // current persona's JSON (authoritative copy)
+    let personaKey = null;  // stable key: nfc:<serial> | tag:<id> | hash:<sha256>
+    let history = [];       // current persona's chat history
 
-    // --- env checks ---
+    // --- environment flags ---
     const nfcOK = 'NDEFReader' in window;
     $('#nfcSupport').textContent = nfcOK ? 'Web NFC available' : 'Web NFC unavailable';
-    const httpsOK = location.protocol === 'https:' || location.hostname === 'localhost';
     $('#secureCtx').textContent = httpsOK ? 'Secure context' : 'Needs HTTPS';
 
-    // --- load persisted config ---
+    // --- persisted relay config ---
     const qsApi = new URLSearchParams(location.search).get('api') || '';
     const savedApi = localStorage.getItem('relayUrl') || '';
     const relayUrl = qsApi || savedApi;
     if (relayUrl) $('#relayUrl').value = relayUrl;
     updateRelayBadge();
 
-    // UI wiring
-    $('#saveRelay').addEventListener('click', () => { localStorage.setItem('relayUrl', $('#relayUrl').value.trim()); updateRelayBadge(); toast('Relay saved'); });
+    // --- boot: restore last persona if present ---
+    (async () => {
+      const last = localStorage.getItem('currentPersona');
+      if (last) {
+        const json = loadTagJSON(last);
+        if (json) {
+          await setTagContext(json, { key: last, source: 'restore' });
+          $('#json').value = JSON.stringify(json, null, 2);
+          toast('Restored last persona');
+        }
+      }
+    })();
+
+    // --- UI wiring ---
+    $('#saveRelay').addEventListener('click', () => { localStorage.setItem('relayUrl', ($('#relayUrl').value||'').trim()); updateRelayBadge(); toast('Relay saved'); });
     $('#testRelay').addEventListener('click', testRelay);
 
-    $('#loadExample').addEventListener('click', () => { const ex = exampleTagJSON(); setTagContext(ex); $('#json').value = JSON.stringify(ex, null, 2); toast('Loaded example'); });
-    $('#saveJson').addEventListener('click', () => { try { const obj = JSON.parse($('#json').value); if ($('#model').value.trim()) obj.model = $('#model').value.trim(); if ($('#temp').value.trim()) obj.temperature = Number($('#temp').value.trim()); setTagContext(obj); toast('Saved'); } catch { toast('Invalid JSON'); } });
+    $('#loadExample').addEventListener('click', async () => { const ex = exampleTagJSON(); await setTagContext(ex, { source: 'manual' }); $('#json').value = JSON.stringify(ex, null, 2); toast('Loaded example'); });
 
-    $('#clearChat').addEventListener('click', () => { if (tagId) localStorage.removeItem('history:' + tagId); history = []; renderChat(); toast('Chat cleared'); });
+    $('#saveJson').addEventListener('click', async () => { try { const obj = JSON.parse($('#json').value); if ($('#model').value.trim()) obj.model = $('#model').value.trim(); if ($('#temp').value.trim()) obj.temperature = Number($('#temp').value.trim()); await setTagContext(obj, { key: personaKey, source: 'manual' }); saveTagJSON(personaKey, obj, { overwrite: true }); toast('Saved'); } catch { toast('Invalid JSON'); } });
+
+    $('#clearChat').addEventListener('click', () => { if (personaKey) localStorage.removeItem('history:' + personaKey); history = []; renderChat(); toast('Chat cleared for this persona'); });
 
     $('#send').addEventListener('click', sendMessage);
     $('#msg').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
@@ -163,16 +178,21 @@ Relay contract (POST JSON):
             }
           }
           const merged = deepMergeAll(parts);
-          setTagContext(merged);
+          const key = await personaKeyFrom(merged, evt?.serialNumber || null);
+
+          // Overwrite stored JSON for this persona with freshly scanned data.
+          saveTagJSON(key, merged, { overwrite: true });
+
+          await setTagContext(merged, { key, source: 'scan' });
           $('#json').value = JSON.stringify(merged, null, 2);
-          toast('Tag read ✔');
+          toast('Tag read ✔ persona set');
         };
       } catch (e) { toast('Scan failed: ' + (e?.message || e)); }
     }
 
     // --- NFC write (example) ---
     async function writeExampleToTag() {
-      // Useful for provisioning demo tags quickly.
+      // Why: quick provisioning of demo tags.
       if (!nfcOK) return toast('Web NFC not supported here');
       if (!httpsOK) return toast('Requires HTTPS (or localhost)');
       try {
@@ -188,7 +208,7 @@ Relay contract (POST JSON):
       if (!msg) return;
       const api = ($('#relayUrl').value || '').trim();
       if (!api) return toast('Set a relay URL first');
-      if (!tagContext) return toast('Load/scan tag JSON first');
+      if (!tagContext || !personaKey) return toast('Load/scan tag JSON first');
 
       $('#msg').value = '';
       history.push({ role: 'user', content: msg });
@@ -200,7 +220,7 @@ Relay contract (POST JSON):
         const j = await r.json();
         if (!r.ok) throw new Error(j?.detail || JSON.stringify(j));
         history.push({ role: 'assistant', content: j.reply || '' });
-        saveHistory(tagId, history);
+        saveHistory(personaKey, history);
         renderChat();
       } catch (e) {
         history.push({ role: 'system', content: 'Error: ' + (e?.message || e) });
@@ -208,7 +228,51 @@ Relay contract (POST JSON):
       }
     }
 
-    // --- utils ---
+    // --- persona helpers ---
+    async function setTagContext(obj, opts = {}) {
+      const key = opts.key || await personaKeyFrom(obj, opts.serialNumber || null);
+      tagContext = obj && typeof obj === 'object' ? obj : {};
+      personaKey = key;
+      localStorage.setItem('currentPersona', key);
+
+      // Update UI label
+      const label = key.length > 20 ? key.slice(0, 20) + '…' : key;
+      $('#tagId').textContent = label || 'no persona';
+
+      // Load persona-specific history
+      history = loadHistory(key);
+      renderChat();
+
+      // Align inputs with tag defaults
+      if ($('#model').value.trim() === '' && obj?.model) $('#model').value = obj.model;
+      if ($('#temp').value.trim() === '' && obj?.temperature != null) $('#temp').value = String(obj.temperature);
+    }
+
+    async function personaKeyFrom(obj, serial) {
+      if (serial && String(serial).trim()) return 'nfc:' + String(serial).trim();
+      const id = obj && typeof obj === 'object' ? (obj.id ?? obj.tagId ?? obj.slug) : null;
+      if (id && String(id).trim()) return 'tag:' + String(id).trim();
+      return 'hash:' + await sha256hex(JSON.stringify(obj || {}));
+    }
+
+    function saveTagJSON(key, obj, { overwrite = true } = {}) {
+      try {
+        if (!key) return;
+        if (!overwrite) {
+          const existing = loadTagJSON(key);
+          if (existing) return;
+        }
+        localStorage.setItem('tagjson:' + key, JSON.stringify(obj));
+      } catch {}
+    }
+    function loadTagJSON(key) {
+      try { return JSON.parse(localStorage.getItem('tagjson:' + key) || 'null'); } catch { return null; }
+    }
+
+    function loadHistory(key) { try { return JSON.parse(localStorage.getItem('history:' + key) || '[]'); } catch { return []; } }
+    function saveHistory(key, hist) { try { localStorage.setItem('history:' + key, JSON.stringify(hist)); } catch {} }
+
+    // --- misc utils ---
     function enrichFromInputs(tc) {
       const x = JSON.parse(JSON.stringify(tc || {}));
       const m = $('#model').value.trim(); if (m) x.model = m;
@@ -226,35 +290,9 @@ Relay contract (POST JSON):
         instructions: 'Always tailor answers to visitors at Gallery #42. When uncertain, ask a clarifying question first.',
         metadata: { venue: 'Main Museum', floor: 2, area: 'Modern' },
         facts: [ 'Artist: Ada Chu (b. 1986)', 'Medium: Reclaimed aluminum & LED', 'Installed: 2023', 'Safe viewing distance: 1 meter' ],
-        context: [ { title: 'Work Title', summary: '"Luminous Echoes" explores perception via light reflections.' }, { title: 'Theme', summary: 'Sustainability and reuse of materials in art.' } ]
+        context: [ { title: 'Work Title', summary: '\"Luminous Echoes\" explores perception via light reflections.' }, { title: 'Theme', summary: 'Sustainability and reuse of materials in art.' } ]
       };
     }
-
-    async function setTagContext(obj) {
-      tagContext = obj && typeof obj === 'object' ? obj : {};
-      if ($('#model').value.trim() === '' && obj?.model) $('#model').value = obj.model;
-      if ($('#temp').value.trim() === '' && obj?.temperature != null) $('#temp').value = String(obj.temperature);
-      const canonical = JSON.stringify(tagContext);
-      tagId = await sha256hex(canonical);
-      $('#tagId').textContent = tagId.slice(0, 10);
-      history = loadHistory(tagId);
-      renderChat();
-    }
-
-    function renderChat() {
-      const el = $('#chat');
-      el.innerHTML = '';
-      if (history.length === 0) el.innerHTML = '<div class="hint">No messages yet. Type your message above.</div>';
-      for (const m of history) {
-        const div = document.createElement('div');
-        div.className = 'bubble ' + (m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'sys');
-        div.textContent = m.content;
-        el.appendChild(div);
-      }
-    }
-
-    function loadHistory(id) { try { return JSON.parse(localStorage.getItem('history:' + id) || '[]'); } catch { return []; } }
-    function saveHistory(id, hist) { try { localStorage.setItem('history:' + id, JSON.stringify(hist)); } catch {} }
 
     function deepMergeAll(arr) { if (!Array.isArray(arr) || arr.length === 0) return {}; return arr.reduce((a,b)=>deepMerge(a,b),{}); }
     function deepMerge(a,b){ if(Array.isArray(a)&&Array.isArray(b))return[...a,...b]; if(isObj(a)&&isObj(b)){const o={...a}; for(const k of Object.keys(b)) o[k]=deepMerge(a[k],b[k]); return o;} return b===undefined?a:b; }
@@ -264,7 +302,6 @@ Relay contract (POST JSON):
     async function fetchJSON(url){ const r=await fetch(url,{headers:{'accept':'application/json'}}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 
     function toast(s){ log('• '+s); }
-
     function updateRelayBadge(){ const v=($('#relayUrl').value||'').trim(); $('#relayStatus').textContent = v ? 'Relay set' : 'No relay'; }
 
     async function testRelay(){ const api=($('#relayUrl').value||'').trim(); if(!api) return toast('Set a relay URL first'); try { const r=await fetch(api,{method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ tagContext:{ system: 'You are a health check.' }, message:'ping', history: [] })}); const j=await r.json(); if(!r.ok) throw new Error(j?.detail || JSON.stringify(j)); toast('Relay OK'); } catch(e){ toast('Relay test failed: '+(e?.message||e)); } }

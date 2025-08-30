@@ -1,0 +1,273 @@
+<!--
+File: index.html
+Host: GitHub Pages (static). No server here.
+Why a relay? Never expose your OpenAI API key in client code. Configure a backend relay URL (e.g., Cloudflare Worker, Vercel/Netlify Function) that accepts { tagContext, message, history } and returns { reply }.
+Relay contract (POST JSON):
+  URL: https://your-relay.example.com/api/chat
+  Body: { tagContext: object, message: string, history: Array<{role: 'user'|'assistant'|'system', content: string}> }
+  Response: { reply: string, model?: string }
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NFC → GPT (GitHub Pages)</title>
+  <meta name="description" content="Scan NFC tags to apply custom JSON context and chat via a secure relay." />
+  <style>
+    :root { --gap: 10px; --r: 14px; --pad: 12px; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; }
+    header { position: sticky; top: 0; background: #fff; border-bottom: 1px solid #e5e7eb; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: var(--pad); }
+    h1 { font-size: 18px; margin: 0; }
+    .row { display: flex; gap: var(--gap); flex-wrap: wrap; align-items: center; }
+    .panel { border: 1px solid #e5e7eb; border-radius: var(--r); padding: var(--pad); background: #fff; }
+    button { padding: 10px 14px; border-radius: var(--r); border: 1px solid #d1d5db; background: #fff; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    input[type="text"], input[type="url"], textarea { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: var(--r); }
+    textarea { min-height: 160px; font-family: var(--mono); font-size: 13px; }
+    .hint { font-size: 12px; opacity: .75; }
+    .badge { font-size: 12px; padding: 2px 8px; border: 1px solid #e5e7eb; border-radius: 999px; }
+    .pill { border: 1px dashed #d1d5db; padding: 4px 8px; border-radius: 999px; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    .chat { display: flex; flex-direction: column; gap: 10px; }
+    .bubble { padding: 10px 12px; border-radius: 16px; max-width: 85%; white-space: pre-wrap; }
+    .user { align-self: flex-end; background: #e5f0ff; }
+    .assistant { align-self: flex-start; background: #f3f4f6; }
+    .sys { align-self: center; background: #fef9c3; }
+    .inputRow { display: grid; grid-template-columns: 1fr auto; gap: var(--gap); }
+    code { font-family: var(--mono); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap row" style="justify-content:space-between;">
+      <div class="row">
+        <h1>NFC → GPT</h1>
+        <span id="nfcSupport" class="badge">Checking NFC…</span>
+        <span id="secureCtx" class="badge">Checking HTTPS…</span>
+      </div>
+      <div class="row">
+        <button id="scan">🔎 Scan NFC</button>
+        <button id="writeExample">✍️ Write Example</button>
+        <button id="loadExample">⬇️ Load Example JSON</button>
+        <button id="clearChat">🧹 Clear Chat</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap grid">
+    <section class="panel">
+      <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <div><strong>Backend Relay</strong> <span class="hint">Required on GitHub Pages (static)</span></div>
+        <span id="relayStatus" class="badge">No relay</span>
+      </div>
+      <div class="row">
+        <input id="relayUrl" type="url" placeholder="https://your-relay.example.com/api/chat" style="flex:1;" />
+        <button id="saveRelay">Save</button>
+        <button id="testRelay">Test</button>
+      </div>
+      <div class="hint" style="margin-top:6px;">Never paste API keys here. Use a server/edge function; enable CORS for this origin.</div>
+    </section>
+
+    <section class="panel">
+      <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <div><strong>Tag JSON</strong> <span class="hint">Editable</span></div>
+        <span id="tagId" class="pill">no tag</span>
+      </div>
+      <textarea id="json" placeholder='Scan an NFC tag (application/json), or click "Load Example JSON"'></textarea>
+      <div class="row" style="justify-content:space-between; align-items:center; margin-top: 6px;">
+        <div class="hint">Supports NDEF <code>application/json</code>, URL (JSON), or text (JSON fallback to plain text).</div>
+        <div class="row" style="gap:6px; align-items:center;">
+          <label class="hint">Model:</label><input id="model" type="text" placeholder="(optional e.g. gpt-4o-mini)" style="width:200px;"/>
+          <label class="hint">Temp:</label><input id="temp" type="text" placeholder="0.7" style="width:80px;"/>
+          <button id="saveJson">Save JSON</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div style="margin-bottom:8px;"><strong>Chat</strong></div>
+      <div id="chat" class="chat"></div>
+      <div class="inputRow" style="margin-top: 8px;">
+        <input id="msg" type="text" placeholder="Type your message…" />
+        <button id="send">Send</button>
+      </div>
+      <div id="log" class="hint" style="margin-top: 8px; white-space: pre-wrap;"></div>
+    </section>
+  </main>
+
+  <script>
+    // Minimal why-comments only.
+
+    // --- tiny helpers ---
+    const $ = (s) => document.querySelector(s);
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const log = (...a) => { const el = $('#log'); el.textContent = [el.textContent, a.join(' ')].filter(Boolean).join('\n'); };
+
+    // --- state ---
+    let tagContext = null;
+    let tagId = null;
+    let history = [];
+
+    // --- env checks ---
+    const nfcOK = 'NDEFReader' in window;
+    $('#nfcSupport').textContent = nfcOK ? 'Web NFC available' : 'Web NFC unavailable';
+    const httpsOK = location.protocol === 'https:' || location.hostname === 'localhost';
+    $('#secureCtx').textContent = httpsOK ? 'Secure context' : 'Needs HTTPS';
+
+    // --- load persisted config ---
+    const qsApi = new URLSearchParams(location.search).get('api') || '';
+    const savedApi = localStorage.getItem('relayUrl') || '';
+    const relayUrl = qsApi || savedApi;
+    if (relayUrl) $('#relayUrl').value = relayUrl;
+    updateRelayBadge();
+
+    // UI wiring
+    $('#saveRelay').addEventListener('click', () => { localStorage.setItem('relayUrl', $('#relayUrl').value.trim()); updateRelayBadge(); toast('Relay saved'); });
+    $('#testRelay').addEventListener('click', testRelay);
+
+    $('#loadExample').addEventListener('click', () => { const ex = exampleTagJSON(); setTagContext(ex); $('#json').value = JSON.stringify(ex, null, 2); toast('Loaded example'); });
+    $('#saveJson').addEventListener('click', () => { try { const obj = JSON.parse($('#json').value); if ($('#model').value.trim()) obj.model = $('#model').value.trim(); if ($('#temp').value.trim()) obj.temperature = Number($('#temp').value.trim()); setTagContext(obj); toast('Saved'); } catch { toast('Invalid JSON'); } });
+
+    $('#clearChat').addEventListener('click', () => { if (tagId) localStorage.removeItem('history:' + tagId); history = []; renderChat(); toast('Chat cleared'); });
+
+    $('#send').addEventListener('click', sendMessage);
+    $('#msg').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+
+    $('#scan').addEventListener('click', scanNFC);
+    $('#writeExample').addEventListener('click', writeExampleToTag);
+
+    // --- NFC read ---
+    async function scanNFC() {
+      if (!nfcOK) return toast('Web NFC not supported here');
+      if (!httpsOK) return toast('Requires HTTPS (or localhost)');
+      try {
+        const ndef = new NDEFReader();
+        await ndef.scan();
+        toast('Bring device to an NFC tag…');
+        ndef.onreadingerror = () => toast('Read error');
+        ndef.onreading = async (evt) => {
+          const parts = [];
+          const dec = new TextDecoder();
+          for (const rec of evt.message.records) {
+            if (rec.recordType === 'mime' && rec.mediaType === 'application/json') {
+              try { parts.push(JSON.parse(dec.decode(rec.data))); } catch {}
+            } else if (rec.recordType === 'url') {
+              const url = dec.decode(rec.data);
+              try { const obj = await fetchJSON(url); if (obj) parts.push(obj); } catch (e) { log('URL fetch failed:', e.message || e); }
+            } else if (rec.recordType === 'text') {
+              const text = new TextDecoder(rec.encoding || 'utf-8').decode(rec.data);
+              try { parts.push(JSON.parse(text)); } catch { parts.push({ contextText: text }); }
+            }
+          }
+          const merged = deepMergeAll(parts);
+          setTagContext(merged);
+          $('#json').value = JSON.stringify(merged, null, 2);
+          toast('Tag read ✔');
+        };
+      } catch (e) { toast('Scan failed: ' + (e?.message || e)); }
+    }
+
+    // --- NFC write (example) ---
+    async function writeExampleToTag() {
+      // Useful for provisioning demo tags quickly.
+      if (!nfcOK) return toast('Web NFC not supported here');
+      if (!httpsOK) return toast('Requires HTTPS (or localhost)');
+      try {
+        const ndef = new NDEFReader();
+        await ndef.write({ records: [{ recordType: 'mime', mediaType: 'application/json', data: new TextEncoder().encode(JSON.stringify(exampleTagJSON())) }] });
+        toast('Wrote example JSON to tag');
+      } catch (e) { toast('Write failed: ' + (e?.message || e)); }
+    }
+
+    // --- chat send ---
+    async function sendMessage() {
+      const msg = $('#msg').value.trim();
+      if (!msg) return;
+      const api = ($('#relayUrl').value || '').trim();
+      if (!api) return toast('Set a relay URL first');
+      if (!tagContext) return toast('Load/scan tag JSON first');
+
+      $('#msg').value = '';
+      history.push({ role: 'user', content: msg });
+      renderChat();
+
+      const body = { tagContext: enrichFromInputs(tagContext), message: msg, history };
+      try {
+        const r = await fetch(api, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j?.detail || JSON.stringify(j));
+        history.push({ role: 'assistant', content: j.reply || '' });
+        saveHistory(tagId, history);
+        renderChat();
+      } catch (e) {
+        history.push({ role: 'system', content: 'Error: ' + (e?.message || e) });
+        renderChat();
+      }
+    }
+
+    // --- utils ---
+    function enrichFromInputs(tc) {
+      const x = JSON.parse(JSON.stringify(tc || {}));
+      const m = $('#model').value.trim(); if (m) x.model = m;
+      const t = $('#temp').value.trim(); if (t !== '') x.temperature = Number(t);
+      return x;
+    }
+
+    function exampleTagJSON() {
+      return {
+        id: 'exhibit-42',
+        name: 'Gallery Exhibit #42',
+        model: 'gpt-4o-mini',
+        temperature: 0.5,
+        system: 'You are a friendly museum docent embedded in a kiosk.',
+        instructions: 'Always tailor answers to visitors at Gallery #42. When uncertain, ask a clarifying question first.',
+        metadata: { venue: 'Main Museum', floor: 2, area: 'Modern' },
+        facts: [ 'Artist: Ada Chu (b. 1986)', 'Medium: Reclaimed aluminum & LED', 'Installed: 2023', 'Safe viewing distance: 1 meter' ],
+        context: [ { title: 'Work Title', summary: '"Luminous Echoes" explores perception via light reflections.' }, { title: 'Theme', summary: 'Sustainability and reuse of materials in art.' } ]
+      };
+    }
+
+    async function setTagContext(obj) {
+      tagContext = obj && typeof obj === 'object' ? obj : {};
+      if ($('#model').value.trim() === '' && obj?.model) $('#model').value = obj.model;
+      if ($('#temp').value.trim() === '' && obj?.temperature != null) $('#temp').value = String(obj.temperature);
+      const canonical = JSON.stringify(tagContext);
+      tagId = await sha256hex(canonical);
+      $('#tagId').textContent = tagId.slice(0, 10);
+      history = loadHistory(tagId);
+      renderChat();
+    }
+
+    function renderChat() {
+      const el = $('#chat');
+      el.innerHTML = '';
+      if (history.length === 0) el.innerHTML = '<div class="hint">No messages yet. Type your message above.</div>';
+      for (const m of history) {
+        const div = document.createElement('div');
+        div.className = 'bubble ' + (m.role === 'user' ? 'user' : m.role === 'assistant' ? 'assistant' : 'sys');
+        div.textContent = m.content;
+        el.appendChild(div);
+      }
+    }
+
+    function loadHistory(id) { try { return JSON.parse(localStorage.getItem('history:' + id) || '[]'); } catch { return []; } }
+    function saveHistory(id, hist) { try { localStorage.setItem('history:' + id, JSON.stringify(hist)); } catch {} }
+
+    function deepMergeAll(arr) { if (!Array.isArray(arr) || arr.length === 0) return {}; return arr.reduce((a,b)=>deepMerge(a,b),{}); }
+    function deepMerge(a,b){ if(Array.isArray(a)&&Array.isArray(b))return[...a,...b]; if(isObj(a)&&isObj(b)){const o={...a}; for(const k of Object.keys(b)) o[k]=deepMerge(a[k],b[k]); return o;} return b===undefined?a:b; }
+    function isObj(x){ return x && typeof x==='object' && !Array.isArray(x); }
+
+    async function sha256hex(str){ const bytes=new TextEncoder().encode(str); const hash=await crypto.subtle.digest('SHA-256', bytes); return [...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,'0')).join(''); }
+    async function fetchJSON(url){ const r=await fetch(url,{headers:{'accept':'application/json'}}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+
+    function toast(s){ log('• '+s); }
+
+    function updateRelayBadge(){ const v=($('#relayUrl').value||'').trim(); $('#relayStatus').textContent = v ? 'Relay set' : 'No relay'; }
+
+    async function testRelay(){ const api=($('#relayUrl').value||'').trim(); if(!api) return toast('Set a relay URL first'); try { const r=await fetch(api,{method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ tagContext:{ system: 'You are a health check.' }, message:'ping', history: [] })}); const j=await r.json(); if(!r.ok) throw new Error(j?.detail || JSON.stringify(j)); toast('Relay OK'); } catch(e){ toast('Relay test failed: '+(e?.message||e)); } }
+  </script>
+</body>
+</html>
